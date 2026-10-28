@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import request from "supertest";
 import { expect, it } from "vitest";
 import { activityLog, issueComments, issueInboxArchives, issueReadStates, issues, issueThreadInteractions, issueAccessGrants, projectAccessMembers, projects } from "@paperclipai/db";
@@ -24,6 +24,7 @@ describeEmbeddedPostgres("Mine unread badge", () => {
     await ctx.db.insert(issueReadStates).values(ids.slice(30).map(issueId => ({ companyId, issueId, userId, lastReadAt: newer })));
     const svc = issueService(ctx.db);
     expect(await svc.unreadInboxIssueIds(companyId, userId, readable)).toEqual([]);
+    expect((await svc.unreadInboxIssueIds(companyId, userId, inArray(issues.id, ids.slice(0, 30)))).sort()).toEqual(ids.slice(0, 30));
     await ctx.db.insert(activityLog).values({ companyId, entityType: "issue", entityId: ids[0]!, actorType: "agent", actorId: "worker", action: "issue.updated", createdAt: newer });
     expect(await svc.unreadInboxIssueIds(companyId, userId, readable)).toEqual([ids[0]]);
     await ctx.db.insert(activityLog).values([
@@ -36,8 +37,8 @@ describeEmbeddedPostgres("Mine unread badge", () => {
   it("keeps text activity IDs exact and company/user scoped", async () => {
     const { companyId, userId } = await seedCompanyWithBoardAccess(ctx.db, "Mine IDs");
     const other = await seedCompanyWithBoardAccess(ctx.db, "Other company");
-    const ids = ["a0000000-0000-4000-8000-000000000001", "b0000000-0000-4000-8000-000000000002", randomUUID(), randomUUID(), randomUUID(), "00000000-0000-0000-0000-000000000000"];
-    await ctx.db.insert(issues).values(ids.map(id => ({ id, companyId, title: id, originKind: "routine_execution", createdAt: old, updatedAt: old })));
+    const ids = ["a0000000-0000-4000-8000-000000000001", "b0000000-0000-4000-8000-000000000002", randomUUID(), randomUUID(), randomUUID(), "00000000-0000-0000-0000-000000000000", randomUUID()];
+    await ctx.db.insert(issues).values(ids.map(id => ({ id, companyId, title: id, originKind: "routine_execution", assigneeUserId: id === ids[6] ? userId : null, createdAt: old, updatedAt: old })));
     await ctx.db.insert(issueComments).values(ids.map(issueId => ({ companyId, issueId, body: "External", createdAt: commentAt })));
     await ctx.db.insert(activityLog).values([
       { companyId, entityType: "issue", entityId: ids[0]!.toUpperCase(), actorType: "user", actorId: userId, action: "issue.updated" },
@@ -49,7 +50,7 @@ describeEmbeddedPostgres("Mine unread badge", () => {
       { companyId, entityType: "project", entityId: ids[3]!, actorType: "user", actorId: userId, action: "issue.updated" },
       { companyId, entityType: "issue", entityId: ids[4]!, actorType: "user", actorId: userId, action: "issue.updated" },
     ]);
-    expect((await issueService(ctx.db).unreadInboxIssueIds(companyId, userId, readable)).sort()).toEqual([ids[4], ids[5]].sort());
+    expect((await issueService(ctx.db).unreadInboxIssueIds(companyId, userId, readable)).sort()).toEqual([ids[4], ids[5], ids[6]].sort());
   });
 
   it("preserves pending request audience, self-creator, dismissal and completion rules", async () => {

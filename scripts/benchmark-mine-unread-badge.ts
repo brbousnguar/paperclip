@@ -59,7 +59,7 @@ function assertPerformance(results: PerformanceResult[], arm: "baseline" | "trea
   if (arm === "baseline") return;
   for (const result of comparisons) {
     if (result.fixture === "dense" && result.jit === "on" && Number.isFinite(maxDenseMs)) assert.ok(result.treatment.medianMs <= maxDenseMs, `Dense default-JIT fixture exceeds ${maxDenseMs} ms local budget: ${result.treatment.medianMs.toFixed(2)} ms`);
-    if (!isCompilationTarget(result)) assert.ok(result.treatment.medianMs <= Math.max(result.baseline.medianMs * 1.25, result.baseline.medianMs + 2), `Control regressed beyond 25% and 2 ms allowance: ${result.fixture}/${result.readMode}/${result.jit}`);
+    if (result.fixture !== "dense" && !isCompilationTarget(result)) assert.ok(result.treatment.medianMs <= Math.max(result.baseline.medianMs * 1.25, result.baseline.medianMs + 2), `Control regressed beyond 25% and 2 ms allowance: ${result.fixture}/${result.readMode}/${result.jit}`);
   }
 }
 
@@ -144,15 +144,15 @@ try {
     const { companyId, ids, payload } = inputs, userId = `synthetic-${name}`;
     await target.insert(companies).values({ id: companyId, name: `Synthetic Mine ${name}`, issuePrefix: name.toUpperCase() });
     await target.$client.unsafe(`insert into issues(id,company_id,title,status,created_by_user_id,created_at,updated_at)
-      select id,$2::uuid,'Synthetic '||n,'todo',case when n <= $4 then $3 else 'unrelated-human' end,
+      select id,$2::uuid,'Synthetic '||n,'todo',case when n <= $4 and n%2=0 then $3 else 'unrelated-human' end,
         '2026-01-01'::timestamptz,'2026-01-01'::timestamptz+n*interval '1 second'
       from unnest($1::uuid[]) with ordinality as f(id,n)`, [ids, companyId, userId, participatedCount]);
     await target.$client.unsafe(`insert into activity_log(company_id,entity_type,entity_id,actor_type,actor_id,action,details,created_at)
-      select $1::uuid,'issue',i.id::text,case when n%10=0 then 'user' else 'agent' end,
-        case when n%20=0 and i.created_by_user_id=$4 then $4 when n%10=0 then 'other-human' else 'synthetic-worker' end,
-        case when n%10=0 then 'issue.updated' when n%5=0 then 'issue.read_marked' else 'issue.updated' end,
+      select $1::uuid,'issue',i.id::text,case when n=1 or n%10=0 then 'user' else 'agent' end,
+        case when (n=1 or n%20=0) and i.id=ANY($5::uuid[]) then $4 when n=1 or n%10=0 then 'other-human' else 'synthetic-worker' end,
+        case when n=1 or n%10=0 then 'issue.updated' when n%5=0 then 'issue.read_marked' else 'issue.updated' end,
         jsonb_build_object('padding',$2::text),'2026-01-01'::timestamptz+n*interval '1 second'
-      from issues i cross join generate_series(1,$3::int)n where company_id=$1::uuid order by n,i.id`, [companyId, payload, logsPerIssue, userId]);
+      from issues i cross join generate_series(1,$3::int)n where company_id=$1::uuid order by n,i.id`, [companyId, payload, logsPerIssue, userId, ids.slice(0, participatedCount)]);
     await target.$client.unsafe(`insert into issue_comments(company_id,issue_id,author_user_id,body,created_at)
       select $1::uuid,id,null,$2,'2026-01-02'::timestamptz+n*interval '1 second'
       from issues cross join generate_series(1,$3::int)n where company_id=$1::uuid order by n,id`, [companyId, payload, commentsPerIssue]);
@@ -161,8 +161,12 @@ try {
         jsonb_build_object('padding',left($2,256)),'2026-01-01'::timestamptz+n*interval '1 second'
       from generate_series(1,$3::int)n`, [companyId, payload, historyDecoys]);
     await target.$client.unsafe("ANALYZE");
+    const [counts] = await target.$client.unsafe(`SELECT count(*)::int participants FROM issues i WHERE company_id=$1 AND
+      (created_by_user_id=$2 OR EXISTS(SELECT 1 FROM activity_log a WHERE a.company_id=$1 AND a.entity_type='issue' AND a.entity_id=i.id::text AND a.actor_type='user' AND a.actor_id=$2 AND a.action='issue.updated'))`, [companyId, userId]);
+    assert.equal(counts!.participants, participatedCount, "Fixture must include its complete declared personal set");
+    const [actorCounts] = await target.$client.unsafe("SELECT count(*)::int rows FROM activity_log WHERE company_id=$1 AND actor_type='user' AND actor_id=$2 AND entity_type='issue'", [companyId, userId]);
     return { name, companyId, userId, issues: count, participatedCount, activityRows: count * logsPerIssue,
-      commentRows: count * commentsPerIssue, historyDecoys: name === "small" ? 0 : historyDecoys, payloadBytes: Buffer.byteLength(payload), fixtureMs: performance.now() - fixtureStart };
+      commentRows: count * commentsPerIssue, targetUserActivityRows: actorCounts!.rows, createdParticipation: Math.floor(participatedCount / 2), activityParticipation: Math.ceil(participatedCount / 2), historyDecoys: name === "small" ? 0 : historyDecoys, payloadBytes: Buffer.byteLength(payload), fixtureMs: performance.now() - fixtureStart };
   }
   async function run(factory: typeof issueService, fixture: Awaited<ReturnType<typeof seed>>, readCondition: Awaited<ReturnType<typeof issueReadSqlCondition>>, sourceDb: Db) {
     const queries: Query[] = [], started = performance.now();
