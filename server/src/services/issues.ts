@@ -8056,12 +8056,20 @@ export function issueService(db: Db) {
     unreadInboxIssueIds: async (companyId: string, userId: string, readCondition: SQL<boolean>) => {
       // Rank the visible Mine set before counting unread, just like the inbox.
       // This projection never reads descriptions, run payloads, or recovery details.
+      const directlyParticipated = or(
+        and(eq(issues.createdByUserId, userId), humanCreatedIssueCondition()),
+        eq(issues.assigneeUserId, userId),
+      );
       const participationSources = unionAll(
         db.select({ id: sql<string | null>`${issues.id}`.as("id") }).from(issues).where(and(
           eq(issues.companyId, companyId),
-          or(and(eq(issues.createdByUserId, userId), humanCreatedIssueCondition()), eq(issues.assigneeUserId, userId)),
+          directlyParticipated,
         )),
-        db.select({ id: sql<string | null>`case when length(${activityLog.entityId}) = 36 and ${activityLog.entityId} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then ${activityLog.entityId}::uuid end`.as("id") }).from(activityLog).where(userParticipationActivityCondition(companyId, userId)),
+        db.select({ id: sql<string | null>`case when length(${activityLog.entityId}) = 36 and ${activityLog.entityId} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then ${activityLog.entityId}::uuid end`.as("id") }).from(activityLog).where(and(
+          userParticipationActivityCondition(companyId, userId),
+          notInArray(activityLog.entityId, db.select({ id: sql<string>`${issues.id}::text` }).from(issues)
+            .where(and(eq(issues.companyId, companyId), directlyParticipated))),
+        )),
         db.select({ id: sql<string | null>`${issueComments.issueId}`.as("id") }).from(issueComments).where(and(
           eq(issueComments.companyId, companyId), eq(issueComments.authorUserId, userId), directHumanCommentCondition(),
         )),
@@ -8070,9 +8078,8 @@ export function issueService(db: Db) {
           .where(pendingUserRequestRowCondition(companyId, userId)),
       ).as("mine_participation_sources");
       const participated = db.selectDistinct({ id: participationSources.id }).from(participationSources).as("mine_participants");
-      const rows = await db.select({
-        id: issues.id,
-      }).from(participated).innerJoin(issues, eq(issues.id, sql`"mine_participants"."id"`)).where(and(
+      const eligible = db.select({ id: issues.id, updatedAt: issues.updatedAt })
+        .from(participated).innerJoin(issues, eq(issues.id, sql`"mine_participants"."id"`)).where(and(
         eq(issues.companyId, companyId),
         visibleIssueCondition(),
         isNull(issues.conversationAgentId),
@@ -8080,7 +8087,9 @@ export function issueService(db: Db) {
         ne(issues.status, "cancelled"),
         inboxVisibleForUserCondition(companyId, userId),
         readCondition,
-      )).orderBy(desc(issueCanonicalLastActivityAtExpr(companyId)), desc(issues.updatedAt), desc(issues.id)).limit(100);
+      )).orderBy(asc(issues.id)).as("issues");
+      const rows = await db.select({ id: eligible.id }).from(eligible)
+        .orderBy(desc(issueCanonicalLastActivityAtExpr(companyId)), desc(eligible.updatedAt), desc(eligible.id)).limit(100);
       if (rows.length === 0) return [];
       // Keep correlated predicates in WHERE (as in the list's user stats).
       // A single-table Drizzle SELECT projection unqualifies nested columns.

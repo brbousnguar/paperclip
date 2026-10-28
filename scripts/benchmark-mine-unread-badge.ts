@@ -24,6 +24,7 @@ const migrationName = "0395_tranquil_firestar.sql";
 const indexName = "activity_log_company_user_issue_actor_idx";
 const migrationSql = await fs.readFile(repositoryPath(`packages/db/src/migrations/${migrationName}`), "utf8");
 const migrationHash = createHash("sha256").update(migrationSql).digest("hex");
+const holdAfterReport = process.argv.find(arg => arg.startsWith("--hold-after-report="))?.slice(20);
 const historyDecoys = Number(process.argv.find(arg => arg.startsWith("--history-decoys="))?.slice(17) ?? 0);
 assert.ok(Number.isSafeInteger(historyDecoys) && historyDecoys >= 0, "--history-decoys must be a nonnegative integer");
 const treatmentIsBaseline = process.argv.includes("--treatment-is-baseline");
@@ -45,17 +46,23 @@ type PerformanceCase = {
 };
 type PerformanceResult = { fixture: { name: string }; cases: PerformanceCase[] };
 function assertPerformance(results: PerformanceResult[], arm: "baseline" | "treatment" = "treatment") {
-  const denseCases = results.find(result => result.fixture.name === "dense")!.cases.filter(result => result.jit === "on");
-  for (const result of denseCases) {
-    if (Number.isFinite(maxDenseMs)) assert.ok(result[arm].medianMs <= maxDenseMs, `Dense default-JIT fixture exceeds ${maxDenseMs}ms local budget: ${result[arm].medianMs.toFixed(2)}ms`);
-    const options = result.plans.find(plan => plan.arm === arm)!.queries[0]!.plan[0]!.JIT?.Options;
-    assert.ok(!options?.Inlining && !options?.Optimization, `Dense ${arm} must avoid full JIT compilation passes`);
-    if (arm === "treatment") assert.ok(result.speedup >= 1.5, `Dense default-JIT fixture requires at least1.5x improvement, observed ${result.speedup.toFixed(2)}x`);
+  const comparisons = results.flatMap(result => result.cases.map(control => ({ fixture: result.fixture.name, ...control })));
+  const jitOptions = (result: PerformanceCase, selected: "baseline" | "treatment") => result.plans.find(plan => plan.arm === selected)!.queries[0]!.plan[0]!.JIT?.Options;
+  const isCompilationTarget = (result: PerformanceCase) => result.jit === "on" && (jitOptions(result, "baseline")?.Inlining || jitOptions(result, "baseline")?.Optimization);
+  const targets = comparisons.filter(isCompilationTarget);
+  assert.ok(targets.length > 0, "Fixture must reproduce expensive baseline JIT compilation");
+  for (const result of targets) {
+    const options = jitOptions(result, arm);
+    assert.ok(!options?.Inlining && !options?.Optimization, `${arm} must avoid full JIT compilation passes`);
+    if (arm === "treatment") assert.ok(result.speedup >= 1.5, `Default-JIT target requires at least 1.5x improvement, observed ${result.speedup.toFixed(2)}x`);
   }
   if (arm === "baseline") return;
-  const controls = results.flatMap(result => result.cases.filter(control => result.fixture.name !== "dense" || control.jit === "off"));
-  for (const control of controls) assert.ok(control.treatment.medianMs <= Math.max(control.baseline.medianMs * 1.25, control.baseline.medianMs + 2), "Control regressed beyond 25% and 2 ms allowance");
+  for (const result of comparisons) {
+    if (result.fixture === "dense" && result.jit === "on" && Number.isFinite(maxDenseMs)) assert.ok(result.treatment.medianMs <= maxDenseMs, `Dense default-JIT fixture exceeds ${maxDenseMs} ms local budget: ${result.treatment.medianMs.toFixed(2)} ms`);
+    if (!isCompilationTarget(result)) assert.ok(result.treatment.medianMs <= Math.max(result.baseline.medianMs * 1.25, result.baseline.medianMs + 2), `Control regressed beyond 25% and 2 ms allowance: ${result.fixture}/${result.readMode}/${result.jit}`);
+  }
 }
+
 if (validateReport) {
   const report = JSON.parse(await fs.readFile(validateReport, "utf8"));
   assert.equal(report.baselineRevision, baselineRevision);
@@ -92,6 +99,7 @@ try {
   baselineConnectionString = baselineUrl.href;
   await applyPendingMigrations(baselineConnectionString);
   baselineDb = createDb(baselineConnectionString, { maxConnections: 1 });
+  await baselineDb.$client.unsafe("set client_min_messages = warning");
   await baselineDb.$client.unsafe(`DROP INDEX "${indexName}"`);
   await baselineDb.$client.unsafe("DELETE FROM drizzle.__drizzle_migrations WHERE hash=$1", [migrationHash]);
   const indexDefinitions = async (source: Db) => source.$client.unsafe("SELECT indexname,indexdef FROM pg_indexes WHERE schemaname='public' ORDER BY indexname");
@@ -249,6 +257,7 @@ try {
   ] as const;
   const selectedShapes = shapes.filter(shape => fixtureFilter === undefined || shape[0] === fixtureFilter);
   assert.ok(selectedShapes.length, "Selected fixture must exist in this diagnostic mode");
+  if (holdAfterReport) assert.equal(selectedShapes.length, 1, "Retain only one explicitly selected diagnostic fixture");
   for (const shape of selectedShapes) {
     const fixture = { ...await seed(...shape), baselineFixtureMs: (await seed(...shape, baselineDb)).fixtureMs };
     if (sampleGateDir) {
@@ -278,7 +287,7 @@ try {
       await fs.rm(release);
     }
     const cases = [];
-    for (const readMode of diagnostic ? ["scoped"] : ["unrestricted", "scoped"]) {
+    for (const readMode of ["unrestricted", "scoped"]) {
     const readCondition = readMode === "unrestricted" ? sql<boolean>`true` : await issueReadSqlCondition(db, {
       type: "board", source: "session", userId: fixture.userId, authorizingUserId: fixture.userId,
     });
@@ -299,16 +308,24 @@ try {
         }
       }
       const beforeTimes: number[] = [], afterTimes: number[] = [];
-      let before: Awaited<ReturnType<typeof run>> | undefined, after: typeof before;
+      let beforeResult: string[] | undefined, afterResult: string[] | undefined;
       for (let iteration = diagnostic ? 0 : -2; iteration < (diagnostic ? 1 : 5); iteration++) {
         const order = iteration % 2 === 0 ? ["before", "after"] : ["after", "before"];
         for (const arm of order) {
-          const current = await run(arm === "before" || treatmentIsBaseline ? baseline.issueService : issueService, fixture, readCondition, arm === "before" ? baselineDb : db);
-          if (arm === "before") { before = current; if (iteration >= 0) beforeTimes.push(current.elapsedMs); }
-          else { after = current; if (iteration >= 0) afterTimes.push(current.elapsedMs); }
+          const sourceDb = arm === "before" ? baselineDb : db;
+          const factory = arm === "before" || treatmentIsBaseline ? baseline.issueService : issueService;
+          const start = performance.now();
+          const current = await factory(sourceDb).unreadInboxIssueIds(fixture.companyId, fixture.userId, readCondition);
+          const elapsedMs = performance.now() - start;
+          if (arm === "before") { beforeResult = current; if (iteration >= 0) beforeTimes.push(elapsedMs); }
+          else { afterResult = current; if (iteration >= 0) afterTimes.push(elapsedMs); }
         }
-        assert.deepEqual(after!.result, before!.result, `${fixture.name}/${jit}: complete returned ID order`);
+        assert.deepEqual(afterResult, beforeResult, `${fixture.name}/${jit}: complete returned ID order`);
       }
+      const before = await run(baseline.issueService, fixture, readCondition, baselineDb);
+      const after = await run(treatmentIsBaseline ? baseline.issueService : issueService, fixture, readCondition, db);
+      assert.deepEqual(before.result, beforeResult, "SQL capture must preserve the measured baseline result");
+      assert.deepEqual(after.result, afterResult, "SQL capture must preserve the measured treatment result");
       assert.equal(before!.queries.length, 2);
       assert.equal(after!.queries.length, 2);
       for (let index = 0; index < 2; index++) {
@@ -333,8 +350,8 @@ try {
     results.push({ fixture, cases });
     if (sampleGateDir) await fs.writeFile(path.join(sampleGateDir, `${fixture.name}.done.json`), JSON.stringify({ fixture, cases }));
     if (verifyMigration && shape === selectedShapes[selectedShapes.length - 1]) migrationProof = await measureMigration(fixture);
-    await db.$client.unsafe("TRUNCATE activity_log, issues, companies CASCADE");
-    await baselineDb.$client.unsafe("TRUNCATE activity_log, issues, companies CASCADE");
+    if (!holdAfterReport) await db.$client.unsafe("TRUNCATE activity_log, issues, companies CASCADE");
+    if (!holdAfterReport) await baselineDb.$client.unsafe("TRUNCATE activity_log, issues, companies CASCADE");
   }
   const report = { baselineRevision, treatmentRevision: gitOutput(["rev-parse", "HEAD"]).trim(),
     treatmentIsBaseline, diagnostic, migrationProof, baselineIndexes, treatmentIndexes, sourceHashes: Object.fromEntries(await Promise.all(proofPaths.map(async file => [file, createHash("sha256").update(await fs.readFile(repositoryPath(file))).digest("hex")]))),
@@ -342,8 +359,19 @@ try {
   const json = JSON.stringify(report, null, 2);
   if (evidenceDir) { await fs.mkdir(evidenceDir, { recursive: true }); await fs.writeFile(path.join(evidenceDir, "benchmark.json"), json); }
   console.log(json);
+  if (holdAfterReport) {
+    await fs.mkdir(holdAfterReport, { recursive: true });
+    await fs.writeFile(path.join(holdAfterReport, "ready.json"), JSON.stringify({ baselineConnectionString, treatmentConnectionString: database.connectionString, baselineDir, fixture: results[0]!.fixture }), { mode: 0o600 });
+    const deadline = Date.now() + 600_000;
+    while (true) {
+      try { await fs.access(path.join(holdAfterReport, "release")); await fs.rm(path.join(holdAfterReport, "release")); break; } catch {}
+      assert.ok(Date.now() < deadline, "Timed out waiting for retained diagnostic release");
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+  }
   if (enforceBudget && !diagnostic) assertPerformance(results);
 } finally {
+  if (holdAfterReport) await fs.rm(path.join(holdAfterReport, "ready.json"), { force: true });
   await baselineDb?.$client.end({ timeout: 0 });
   await db?.$client.end({ timeout: 0 });
   await database?.cleanup();
