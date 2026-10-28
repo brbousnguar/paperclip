@@ -16,6 +16,10 @@ const baselineRef = process.argv.find(arg => arg.startsWith("--baseline-ref="))?
 assert.ok(baselineRef, "Pass a pinned pre-fix --baseline-ref=<commit>");
 const baselineRevision = gitOutput(["rev-parse", `${baselineRef}^{commit}`]).trim();
 const diagnostic = process.argv.includes("--diagnostic");
+const diagnosticDense = process.argv.includes("--diagnostic-dense");
+const candidateIndex = process.argv.includes("--candidate-index");
+const historyDecoys = Number(process.argv.find(arg => arg.startsWith("--history-decoys="))?.slice(17) ?? 0);
+assert.ok(Number.isSafeInteger(historyDecoys) && historyDecoys >= 0, "--history-decoys must be a nonnegative integer");
 const treatmentIsBaseline = process.argv.includes("--treatment-is-baseline");
 const enforceBudget = process.argv.includes("--assert-performance");
 const maxDenseArgument = process.argv.find(arg => arg.startsWith("--max-dense-ms="))?.slice(15);
@@ -119,9 +123,13 @@ try {
     await db!.$client.unsafe(`insert into issue_comments(company_id,issue_id,author_user_id,body,created_at)
       select $1::uuid,id,null,$2,'2026-01-02'::timestamptz+n*interval '1 second'
       from issues cross join generate_series(1,$3::int)n where company_id=$1::uuid order by n,id`, [companyId, payload, commentsPerIssue]);
+    if (historyDecoys > 0 && name !== "small") await db!.$client.unsafe(`insert into activity_log(company_id,entity_type,entity_id,actor_type,actor_id,action,details,created_at)
+      select $1::uuid,'heartbeat_run',gen_random_uuid()::text,'agent','synthetic-worker','heartbeat.run.created',
+        jsonb_build_object('padding',left($2,256)),'2026-01-01'::timestamptz+n*interval '1 second'
+      from generate_series(1,$3::int)n`, [companyId, payload, historyDecoys]);
     await db!.$client.unsafe("ANALYZE");
     return { name, companyId, userId, issues: count, participatedCount, activityRows: count * logsPerIssue,
-      commentRows: count * commentsPerIssue, payloadBytes: Buffer.byteLength(payload), fixtureMs: performance.now() - fixtureStart };
+      commentRows: count * commentsPerIssue, historyDecoys: name === "small" ? 0 : historyDecoys, payloadBytes: Buffer.byteLength(payload), fixtureMs: performance.now() - fixtureStart };
   }
   async function run(factory: typeof issueService, fixture: Awaited<ReturnType<typeof seed>>, readCondition: Awaited<ReturnType<typeof issueReadSqlCondition>>) {
     const queries: Query[] = [], started = performance.now();
@@ -131,13 +139,14 @@ try {
   }
   const stats = (values: number[]) => ({ samplesMs: values, medianMs: [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)], minMs: Math.min(...values), maxMs: Math.max(...values) });
   const results = [];
-  const shapes = diagnostic ? [["sparse", 1200, 12, 50, 20] as const] : [
+  const shapes = diagnostic ? [[diagnosticDense ? "dense" : "sparse", 1200, diagnosticDense ? 1200 : 12, 50, 20] as const] : [
     ["small", 12, 12, 4, 2],
     ["dense", 1200, 1200, 50, 20],
     ["sparse", 1200, 12, 50, 20],
   ] as const;
   for (const shape of shapes) {
     const fixture = await seed(...shape);
+    if (candidateIndex) await db.$client.unsafe("CREATE INDEX mine_user_activity_candidate ON activity_log(company_id,actor_id,entity_id) WHERE actor_type='user' AND entity_type='issue'");
     if (sampleGateDir) {
       await fs.mkdir(sampleGateDir, { recursive: true });
       const release = path.join(sampleGateDir, `${fixture.name}.release`);
@@ -217,10 +226,11 @@ try {
     }
     results.push({ fixture, cases });
     if (sampleGateDir) await fs.writeFile(path.join(sampleGateDir, `${fixture.name}.done.json`), JSON.stringify({ fixture, cases }));
+    if (candidateIndex) await db.$client.unsafe("DROP INDEX mine_user_activity_candidate");
     await db.$client.unsafe("TRUNCATE activity_log, issues, companies CASCADE");
   }
   const report = { baselineRevision, treatmentRevision: gitOutput(["rev-parse", "HEAD"]).trim(),
-    treatmentIsBaseline, diagnostic, sourceHashes: Object.fromEntries(await Promise.all(modulePaths.map(async file => [file, createHash("sha256").update(await fs.readFile(repositoryPath(file))).digest("hex")]))),
+    treatmentIsBaseline, diagnostic, candidateIndex, sourceHashes: Object.fromEntries(await Promise.all(modulePaths.map(async file => [file, createHash("sha256").update(await fs.readFile(repositoryPath(file))).digest("hex")]))),
     checkedInLockSha256: createHash("sha256").update(await fs.readFile(repositoryPath("pnpm-lock.yaml"))).digest("hex"), nodeVersion: process.version, dependencyVersions: Object.fromEntries(await Promise.all(["postgres", "drizzle-orm"].map(async name => [name, JSON.parse(await fs.readFile(repositoryPath(`packages/db/node_modules/${name}/package.json`), "utf8")).version]))), settings, setupMs, totalMs: performance.now() - started, results };
   const json = JSON.stringify(report, null, 2);
   if (evidenceDir) { await fs.mkdir(evidenceDir, { recursive: true }); await fs.writeFile(path.join(evidenceDir, "benchmark.json"), json); }
