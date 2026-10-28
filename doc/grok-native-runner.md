@@ -67,9 +67,10 @@ its native runtime identity is `native:grok` version 1.0.13. The historical
 `agentServerPackage`/`agentRuntimePackage` wire fields carry these identities,
 not npm dependencies. Existing npm-backed ACP bridges retain their package pins.
 
-Grok launch profile 6 binds the native effort, search, credential, sidecar, and
-Runner admission source. An older installed pack with the same ACPX interface
-version cannot satisfy this profile. The controller stages its current verified
+Grok launch profile 7 binds the native effort, search, credential, sidecar, and
+Runner admission source, including Rust backend descriptor writes. An older
+installed pack with the same ACPX interface version cannot satisfy this profile.
+The controller stages its current verified
 pack instead. A generated source-identity comment in the launcher preserves the
 existing command byte-digest check; no installation guard is relaxed.
 App source changes alone still permit reuse when the selected

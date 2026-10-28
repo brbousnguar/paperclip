@@ -7,9 +7,14 @@ import { fileURLToPath } from "node:url";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repositoryRoot = resolve(packageRoot, "../..");
-// Versions 1–5 remain decodable historical identities. Published fixtures are
-// immutable; advance this version before changing a released declaration.
-export const GROK_PROFILE_VERSION = 6;
+// Versions 1–6 remain decodable historical identities. Versioned fixtures are
+// immutable; advance this version before changing a versioned declaration.
+export const GROK_PROFILE_VERSION = 7;
+// Contract surfaces: ACPX wire patch; sidecar parsing and error translation;
+// native effort/search/credential admission; host/sandbox/tool-bridge execution;
+// launcher integrity and platform pins; Rust descriptor writes, session state,
+// and transport classification. This is an explicit boundary list, not the
+// sidecar's complete import graph.
 export const GROK_PROFILE_SOURCE_FILES = [
   "patches/acpx@0.13.1.patch",
   ...[
@@ -20,6 +25,7 @@ export const GROK_PROFILE_SOURCE_FILES = [
     "src/drivers/acpx/runtime-sandbox.ts", "src/drivers/acpx/sidecar-protocol.ts",
     "src/drivers/acpx/native-distribution-integrity.ts",
     "src/providers/grok/launcher.cjs", "src/providers/grok/platforms.json",
+    "runner/crates/runner-core/src/acpx_provider_backend.rs",
     "runner/crates/runner-core/src/acpx_provider_session.rs",
     "runner/crates/runner-core/src/acpx_sidecar_transport.rs",
   ].map(path => `packages/paperclip-runner/${path}`),

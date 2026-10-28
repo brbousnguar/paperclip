@@ -17,18 +17,22 @@ test("the active Grok profile attests its exact admission source", () => {
   assert.equal(manifest.profiles.grok.agentProfileVersion, GROK_PROFILE_VERSION);
 });
 
-test("changing the session.open contract invalidates the Grok identity", () => {
+for (const contract of [
+  "src/cli/acpx-runtime-sidecar.ts",
+  "runner/crates/runner-core/src/acpx_provider_backend.rs",
+]) test(`changing the Grok field in ${contract} invalidates the identity`, () => {
   const copy = mkdtempSync(join(tmpdir(), "grok-profile-source-"));
   try {
-    for (const path of ["packages/paperclip-runner/acpx-profiles.json", ...GROK_PROFILE_SOURCE_FILES]) {
+    for (const path of ["packages/paperclip-runner/acpx-profiles.json", ...GROK_PROFILE_SOURCE_FILES,
+      `packages/paperclip-runner/${contract}`]) {
       mkdirSync(dirname(join(copy, path)), { recursive: true });
       copyFileSync(join(root, path), join(copy, path));
     }
     const before = grokProfileIdentity(copy);
-    const sidecar = join(copy, "packages/paperclip-runner/src/cli/acpx-runtime-sidecar.ts");
-    const source = readFileSync(sidecar, "utf8");
+    const contractPath = join(copy, "packages/paperclip-runner", contract);
+    const source = readFileSync(contractPath, "utf8");
     assert.ok(source.includes('"grokEffort"'));
-    writeFileSync(sidecar, source.replace('"grokEffort"', '"obsoleteGrokEffort"'));
+    writeFileSync(contractPath, source.replace('"grokEffort"', '"obsoleteGrokEffort"'));
     assert.notEqual(grokProfileIdentity(copy).commandDigest, before.commandDigest);
   } finally {
     rmSync(copy, { recursive: true, force: true });
