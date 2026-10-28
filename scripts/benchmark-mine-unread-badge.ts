@@ -9,9 +9,12 @@ import { companies, createDb, startEmbeddedPostgresTestDatabase, type Db } from 
 import { issueService } from "../server/src/services/issues.js";
 import { issueReadSqlCondition } from "../server/src/services/authorization.js";
 
+const repositoryRoot = fileURLToPath(new URL("../", import.meta.url));
+const repositoryPath = (relative: string) => path.join(repositoryRoot, relative);
+const gitOutput = (args: string[]) => execFileSync("git", args, { cwd: repositoryRoot, encoding: "utf8" });
 const baselineRef = process.argv.find(arg => arg.startsWith("--baseline-ref="))?.slice(15);
 assert.ok(baselineRef, "Pass a pinned pre-fix --baseline-ref=<commit>");
-const baselineRevision = execFileSync("git", ["rev-parse", `${baselineRef}^{commit}`], { encoding: "utf8" }).trim();
+const baselineRevision = gitOutput(["rev-parse", `${baselineRef}^{commit}`]).trim();
 const diagnostic = process.argv.includes("--diagnostic");
 const treatmentIsBaseline = process.argv.includes("--treatment-is-baseline");
 const enforceBudget = process.argv.includes("--assert-performance");
@@ -23,7 +26,7 @@ const sampleGateDir = process.argv.find(arg => arg.startsWith("--sample-gate-dir
 const evidenceDir = process.argv.find(arg => arg.startsWith("--evidence-dir="))?.slice(15);
 const started = performance.now();
 const modulePaths = ["server/src/services/issues.ts", "server/src/services/issue-participation.ts"];
-const changedDependencies = execFileSync("git", ["diff", "--name-only", baselineRevision, "--", "server/src/services", "packages/db/src", "packages/shared/src"], { encoding: "utf8" }).trim().split("\n").filter(Boolean);
+const changedDependencies = gitOutput(["diff", "--name-only", baselineRevision, "--", "server/src/services", "packages/db/src", "packages/shared/src"]).trim().split("\n").filter(Boolean);
 assert.deepEqual(changedDependencies.filter(file => !modulePaths.includes(file)), [], "Baseline must use unchanged service dependencies");
 type PerformanceCase = {
   jit: string; readMode: string; baseline: { medianMs: number }; treatment: { medianMs: number }; speedup: number;
@@ -45,20 +48,20 @@ function assertPerformance(results: PerformanceResult[], arm: "baseline" | "trea
 if (validateReport) {
   const report = JSON.parse(await fs.readFile(validateReport, "utf8"));
   assert.equal(report.baselineRevision, baselineRevision);
-  for (const [file, hash] of Object.entries(report.sourceHashes)) assert.equal(createHash("sha256").update(await fs.readFile(file)).digest("hex"), hash, `Source changed since measured report: ${file}`);
+  for (const [file, hash] of Object.entries(report.sourceHashes)) assert.equal(createHash("sha256").update(await fs.readFile(repositoryPath(file))).digest("hex"), hash, `Source changed since measured report: ${file}`);
   assertPerformance(report.results, validateBaseline ? "baseline" : "treatment");
   console.log(JSON.stringify({ status: "performance budget passed", report: validateReport, baselineRevision, sourceHashes: report.sourceHashes }));
   process.exit(0);
 }
 const baselineDir = await fs.mkdtemp(path.join(fileURLToPath(new URL("../server/scripts/", import.meta.url)), ".mine-unread-baseline-"));
 const rewrite = (source: string, originalPath: string) => source.replace(/from "(\.{1,2}\/[^\"]+)"/g, (_match, specifier: string) => {
-  const resolved = fileURLToPath(new URL(specifier, pathToFileURL(path.resolve(originalPath))));
+  const resolved = fileURLToPath(new URL(specifier, pathToFileURL(repositoryPath(originalPath))));
   const target = resolved.endsWith("/services/issue-participation.js")
     ? path.join(baselineDir, "issue-participation.ts") : resolved;
   return `from ${JSON.stringify(target)}`;
 });
 for (const modulePath of modulePaths) {
-  const source = execFileSync("git", ["show", `${baselineRevision}:${modulePath}`], { encoding: "utf8" });
+  const source = gitOutput(["show", `${baselineRevision}:${modulePath}`]);
   await fs.writeFile(path.join(baselineDir, path.basename(modulePath)), rewrite(source, modulePath));
 }
 const baseline = await import(pathToFileURL(path.join(baselineDir, "issues.ts")).href) as typeof import("../server/src/services/issues.js");
@@ -216,9 +219,9 @@ try {
     if (sampleGateDir) await fs.writeFile(path.join(sampleGateDir, `${fixture.name}.done.json`), JSON.stringify({ fixture, cases }));
     await db.$client.unsafe("TRUNCATE activity_log, issues, companies CASCADE");
   }
-  const report = { baselineRevision, treatmentRevision: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
-    treatmentIsBaseline, diagnostic, sourceHashes: Object.fromEntries(await Promise.all(modulePaths.map(async file => [file, createHash("sha256").update(await fs.readFile(file)).digest("hex")]))),
-    checkedInLockSha256: createHash("sha256").update(await fs.readFile("pnpm-lock.yaml")).digest("hex"), nodeVersion: process.version, dependencyVersions: Object.fromEntries(await Promise.all(["postgres", "drizzle-orm"].map(async name => [name, JSON.parse(await fs.readFile(`packages/db/node_modules/${name}/package.json`, "utf8")).version]))), settings, setupMs, totalMs: performance.now() - started, results };
+  const report = { baselineRevision, treatmentRevision: gitOutput(["rev-parse", "HEAD"]).trim(),
+    treatmentIsBaseline, diagnostic, sourceHashes: Object.fromEntries(await Promise.all(modulePaths.map(async file => [file, createHash("sha256").update(await fs.readFile(repositoryPath(file))).digest("hex")]))),
+    checkedInLockSha256: createHash("sha256").update(await fs.readFile(repositoryPath("pnpm-lock.yaml"))).digest("hex"), nodeVersion: process.version, dependencyVersions: Object.fromEntries(await Promise.all(["postgres", "drizzle-orm"].map(async name => [name, JSON.parse(await fs.readFile(repositoryPath(`packages/db/node_modules/${name}/package.json`), "utf8")).version]))), settings, setupMs, totalMs: performance.now() - started, results };
   const json = JSON.stringify(report, null, 2);
   if (evidenceDir) { await fs.mkdir(evidenceDir, { recursive: true }); await fs.writeFile(path.join(evidenceDir, "benchmark.json"), json); }
   console.log(json);
